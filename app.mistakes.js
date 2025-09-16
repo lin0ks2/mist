@@ -1,15 +1,26 @@
 /**
  * app.mistakes.js
- * Mistakes are collected STRICTLY per current UI language (App.settings.lang),
- * aggregated across all dictionaries of that language.
- * Storage (localStorage 'mistakes.v1'):
- * { <lang>: { <dictKey>: { <wordId>: { ts:<ms>, seen:<n> } } } }
+ * Mistakes are bucketed STRICTLY by current UI language (App.settings.lang),
+ * and UI (list/count/deck) additionally filters by the TARGET dictionary language
+ * of the active dictionary (via App.Decks.langOfKey(App.dictRegistry.activeKey)).
+ *
+ * localStorage key: 'mistakes.v1'
+ * Structure:
+ * {
+ *   <uiLang>: {
+ *     <dictKey>: {
+ *       <wordId>: { ts:<ms>, seen:<n> }
+ *     }
+ *   }
+ * }
  */
 (function(){
   var App = window.App || (window.App = {});
   var LS_KEY = 'mistakes.v1';
-  var MAX_PER_LANG = 1000; // safety cap per language
+  var LAST_TLANG_KEY = 'mistakes.lastTargetLang';
+  var MAX_PER_LANG = 1000; // safety cap per UI language
 
+  // ---------- utils ----------
   function load(){
     try{
       var raw = localStorage.getItem(LS_KEY);
@@ -19,8 +30,7 @@
   function save(db){
     try{ localStorage.setItem(LS_KEY, JSON.stringify(db)); }catch(e){}
   }
-  function activeLang(){
-    // current UI language is the single source of truth
+  function activeLang(){ // UI language is the bucket key
     return (App.settings && App.settings.lang) || 'ru';
   }
   function now(){ return Date.now ? Date.now() : (+new Date()); }
@@ -34,8 +44,7 @@
   function totalCountForLang(db, lang){
     var total=0, L=db[lang]||{};
     for (var k in L){ if (!L.hasOwnProperty(k)) continue;
-      var m=L[k];
-      total += Object.keys(m||{}).length;
+      total += Object.keys(L[k]||{}).length;
     }
     return total;
   }
@@ -50,11 +59,12 @@
         items.push([dk, id, map[id].ts||0]);
       }
     }
+    // oldest first
     items.sort(function(a,b){ return (a[2]|0) - (b[2]|0); });
     var toDrop = total - MAX_PER_LANG;
     for (var i=0; i<toDrop && i<items.length; i++){
       var dk = items[i][0], id = items[i][1];
-      delete db[lang][dk][id];
+      delete L[dk][id];
     }
   }
 
@@ -70,44 +80,80 @@
     }catch(e){}
     return null;
   }
+
+  // Determine CURRENT TARGET dictionary language (the language of the active dictionary).
+  // If activeKey is 'mistakes', fallback to the last remembered target language.
+  function targetLang(){
+    try{
+      var key = (App.dictRegistry && App.dictRegistry.activeKey) || null;
+      if (key && key !== 'mistakes'){
+        var tl = langOfKey(key);
+        if (tl){
+          try { localStorage.setItem(LAST_TLANG_KEY, tl); } catch(e){}
+          return tl;
+        }
+      }
+    }catch(e){}
+    // fallback to last known
+    try{
+      var tl2 = localStorage.getItem(LAST_TLANG_KEY);
+      if (tl2) return tl2;
+    }catch(e){}
+    return null;
+  }
+
+  // Track changes from UI (optional, если у тебя кидается это событие)
+  try {
+    document.addEventListener('dict:title:updated', function(ev){
+      try{
+        var key = ev && ev.detail && ev.detail.key;
+        var tl = key ? langOfKey(key) : null;
+        if (tl) localStorage.setItem(LAST_TLANG_KEY, tl);
+      }catch(_){}
+    });
+  } catch(_){}
+
   function indexDeckById(deck){
     var idx={};
     for (var i=0;i<deck.length;i++){ idx[String(deck[i].id)] = deck[i]; }
     return idx;
   }
 
+  // ---------- public API ----------
   App.Mistakes = {
     /**
      * Add/refresh a mistake.
-     * IMPORTANT: we always bucket by current UI language (activeLang()),
-     * so mistakes never mix across languages.
+     * IMPORTANT: mistakes are bucketed by CURRENT UI language ONLY.
      */
     add: function(id, card, sourceKey){
       try{
         id = String(id);
-        var lang = activeLang();
-        // Source dictKey is still stored on the leaf for retrieval, but language is taken from UI.
         var dictKey = sourceKey || (card && card.sourceKey) || (App.dictRegistry && App.dictRegistry.activeKey) || null;
         if (!dictKey) return;
 
+        var lang = activeLang(); // <-- ключевой момент: всегда язык интерфейса
         var db = load();
         var bucket = ensure(db, lang, dictKey);
+
         if (!bucket[id]) bucket[id] = { ts: now(), seen: 1 };
         else { bucket[id].seen = (bucket[id].seen|0)+1; bucket[id].ts = now(); }
+
         evictIfNeeded(db, lang);
         save(db);
       }catch(e){}
     },
 
-    /** Preview list for CURRENT language only (id + dictKey), newest first. */
+    /** Preview list for CURRENT UI language, filtered by CURRENT TARGET dict language (if known). */
     list: function(){
       var lang = activeLang();
       var db = load();
       var L = db[lang] || {};
+      var tLang = targetLang();
+
       var out=[];
       for (var dk in L){ if (!L.hasOwnProperty(dk)) continue;
-        // hard filter by dict language: only dicts of CURRENT lang
-        if (langOfKey(dk) && langOfKey(dk) !== lang) continue;
+        var dkLang = langOfKey(dk);
+        if (tLang && dkLang && dkLang !== tLang) continue; // фильтр по языку словаря
         var m=L[dk];
         for (var id in m){ if (!m.hasOwnProperty(id)) continue;
           out.push({ id: id, dictKey: dk, ts: m[id].ts||0 });
@@ -117,34 +163,39 @@
       return out;
     },
 
-    /** Count unique mistakes for CURRENT language only. */
+    /** Count unique mistakes for CURRENT UI language, filtered by CURRENT TARGET dict language. */
     count: function(){
       var lang = activeLang();
       var db = load();
       var L = db[lang] || {};
+      var tLang = targetLang();
+
       var total=0;
       for (var dk in L){ if (!L.hasOwnProperty(dk)) continue;
-        if (langOfKey(dk) && langOfKey(dk) !== lang) continue;
+        var dkLang = langOfKey(dk);
+        if (tLang && dkLang && dkLang !== tLang) continue;
         total += Object.keys(L[dk]||{}).length;
       }
       return total;
     },
 
     /**
-     * Build training deck for CURRENT language from all dicts of that language.
-     * Cleans stale ids and skips dicts of other languages defensively.
+     * Build training deck for CURRENT UI language, filtered by CURRENT TARGET dict language.
+     * Also removes stale ids that no longer exist in their source dictionaries.
      */
     deck: function(){
       var lang = activeLang();
       var db = load();
       var L = db[lang] || {};
+      var tLang = targetLang();
+
       var out=[];
       var perDictIndex = {};
 
-      // Build per-dict index for dicts of CURRENT language
+      // Build per-dict index for dicts that match targetLang (if known)
       for (var dk in L){ if (!L.hasOwnProperty(dk)) continue;
         var dkLang = langOfKey(dk);
-        if (dkLang && dkLang !== lang) continue;
+        if (tLang && dkLang && dkLang !== tLang) continue;
         var deck = resolveDeck(dk);
         if (!deck || !deck.length) continue;
         perDictIndex[dk] = indexDeckById(deck);
@@ -163,7 +214,7 @@
             out.push(ww);
           }else{
             // stale -> drop it
-            delete db[lang][dk][id];
+            delete L[dk][id];
           }
         }
       }
@@ -171,15 +222,17 @@
 
       // newest first
       out.sort(function(a,b){
-        var A = (L[a._mistakeSourceKey]||{})[String(a.id)];
-        var B = (L[b._mistakeSourceKey]||{})[String(b.id)];
+        // guard if L[dk] changed above
+        var Amap = L[a._mistakeSourceKey] || {};
+        var Bmap = L[b._mistakeSourceKey] || {};
+        var A = Amap[String(a.id)], B = Bmap[String(b.id)];
         var ta = A?A.ts:0, tb = B?B.ts:0;
         return (tb|0) - (ta|0);
       });
       return out;
     },
 
-    /** Original source dict for id (CURRENT language bucket only). */
+    /** Original source dict for id (CURRENT UI language bucket only). */
     sourceKeyFor: function(id){
       var lang = activeLang();
       var db = load();
@@ -191,7 +244,7 @@
       return null;
     },
 
-    /** Clear mistakes for CURRENT language only. */
+    /** Clear mistakes for CURRENT UI language only. */
     clearActive: function(){
       var lang = activeLang();
       var db = load();
